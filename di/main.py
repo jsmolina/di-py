@@ -16,10 +16,13 @@ It doesn't form a *framework* but just a set of utilities to keep the dependency
 injection needs in a project under control by applying it only where it makes
 sense, with minimum overhead and a lean learning curve.
 """
-
+import sys
 import logging
+import warnings
+import types
 import inspect
 import functools
+from contextlib import contextmanager
 
 import threading
 try:
@@ -27,6 +30,8 @@ try:
 except ImportError:
     # Python 3.3 exposes .get_ident on the threading module
     thread = threading
+
+PY2 = sys.version_info[0] == 2
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,9 @@ class Key(object):
             self.value = (value,) + values
         else:
             self.value = value
+
+    def __hash__(self):
+        return hash(self.value)
 
     def __eq__(self, other):
         if isinstance(other, Key):
@@ -87,7 +95,7 @@ def injector(dependencies):
         following calls to decorated methods.
 
         A common pattern is to apply dependency injection only when instantiating
-        a class. This can be easily accomplish by decorating the class' __init__
+        a class. This can be easily accomplished by decorating the class' __init__
         method, storing injected values as object attributes.
 
             @inject
@@ -100,7 +108,13 @@ def injector(dependencies):
         is not supported.
     """
 
-    def wrapper(fn):
+    if isinstance(dependencies, (types.FunctionType, types.BuiltinFunctionType, functools.partial)):
+        raise RuntimeError('It seems injector is being used as a decorator instead of a decorator factory. Usage: inject = injector(deps)')
+
+    # Prepare the dependencies storage stack
+    deps_stack = [dependencies]
+
+    def wrapper(fn, warn=True):
         # Extract default values for keyword arguments
         args, varargs, keywords, defaults = inspect.getargspec(fn)
         if defaults:
@@ -116,13 +130,12 @@ def injector(dependencies):
             elif inspect.isclass(default):
                 mapping[name] = default
 
-        if not mapping:
-            logger.debug('%s: No injectable params found. You can safely remove the decorator.',
-                         fn.__name__)
+        if warn and not mapping:
+            warnings.warn('{0}: No injectable params found. You can safely remove the decorator.'.format(fn.__name__), stacklevel=2)
             return fn
 
         # Micro optimization: prepare mapping as a list of pairs
-        pairs = mapping.items()
+        pairs = tuple(mapping.items())
 
         # Wrapper executed on each invocation of the decorated method
         @functools.wraps(fn)
@@ -130,30 +143,53 @@ def injector(dependencies):
             # Micro optimization: cache logger level
             debug = logger.isEnabledFor(logging.DEBUG)
 
+            # Alias the latest dependencies
+            deps = deps_stack[-1]
+
+            # Adapt for deprecated property
+            if deps is not wrapper.dependencies:
+                warnings.warn('dependencies property is deprecated, please use patch/unpatch', stacklevel=2)
+                patch(wrapper.dependencies)
+                deps = wrapper.dependencies
+
             # Iterate over the set of 'injectable' parameters
-            for name, key in pairs:
+            for name, dependency in pairs:
                 # If the argument was not explicitly given inject it
                 if name not in kwargs:
-                    debug and logger.debug('%s: Injecting %s with %s', fn.__name__, name, key)
+                    debug and logger.debug('%s: Injecting %s with %s', fn.__name__, name, dependency)
                     # Avoid using `in` operator to check, so we can work with
                     # maps not supporting __contain__
                     try:
-                        kwargs[name] = wrapper.dependencies[key]
+                        kwargs[name] = deps[dependency]
                     except KeyError:
                         raise LookupError('Unable to find an instance for {0} when calling {1}'.format(
-                            key, fn.__name__))
+                            dependency, fn.__name__))
 
             return fn(*args, **kwargs)
 
         return inner
 
-    # Expose the dependency map publicly in the decorator
-    wrapper.dependencies = dependencies
+    def patch(deps):
+        deps_stack.append(deps)
+        wrapper.dependencies = deps
+
+    def unpatch():
+        if len(deps_stack) < 2:
+            raise RuntimeError('Unable to unpatch. Did you call patch?')
+        deps_stack.pop()
+        wrapper.dependencies = deps_stack[-1]
+
+    # Allow calling sites to change the dependency map
+    wrapper.patch = patch
+    wrapper.unpatch = unpatch
+
+    # Deprecated: Expose the dependency map publicly in the decorator
+    wrapper.dependencies = deps_stack[-1]
 
     return wrapper
 
 
-def MetaInject(injector):
+def MetaInject(inject_fn):
     """
         Builds a metaclass with the *injector* parameter as dependecy injector.
     """
@@ -187,7 +223,7 @@ def MetaInject(injector):
             methods = ((k, v) for (k, v) in dct.items() if is_user_function(k, v))
 
             for m, fn in methods:
-                dct[m] = injector(fn)
+                dct[m] = inject_fn(fn, warn=False)
 
             return type.__new__(cls, name, bases, dct)
 
@@ -272,6 +308,29 @@ class DependencyMap(object):
 
         return key in self._values
 
+    def __enter__(self):
+        """ ContextManager interface to temporally modify dependencies.
+
+            >>> deps[MyClass] = True
+            >>> with deps:
+            >>>    deps[MyClass] = False
+            >>> assert deps[MyClass] is True
+        """
+        self._saved = (self._values, self._flags)
+        self._values = dict((k, v) for k, v in self._values.items())
+        return self._values
+
+    def __exit__(self, type, value, traceback):
+        self._values, self._flags = self._saved
+
+    def proxy(self, key):
+        """ Proxy factory method.
+
+            >>> dm = DependencyMap()
+            >>> my_injected_dep = dm.proxy(Spam)
+        """
+        return InjectorProxy(self, key)
+
     def register(self, key, value, flags=NONE):
         """ Register a new dependency optionally giving it a set of flags
         """
@@ -313,12 +372,24 @@ class ContextualDependencyMap(DependencyMap):
         self._maps = {}
         self.map = self
 
-    def context(self, context):
-        """ Changes the current context for the dependencies returning the
-            child dependency map corresponding to the given context.
-            New context values will automatically create a child dependency map
-            associated with it.
-            This method will return the selected dependency map instance.
+    @contextmanager
+    def activate(self, context):
+        """ Context manager to temporary activate a given DependencyMap
+            for the duration of the with block.
+
+                with deps.activate('es'):
+                    ...
+        """
+        saved = self.map
+        try:
+            yield self.context(context)
+        finally:
+            self.map = saved
+
+    def context(self, context=None):
+        """ Switches the active set of the dependencies. New context values
+            will automatically create a DependencyMap associated with it.
+            Returns the dependency map instance switched to.
         """
         # If no context is given the context-less map is activated
         if context is None:
@@ -456,3 +527,118 @@ class InjectorDescriptor(object):
             return self.dependencies[self.class_obj]
         except KeyError:
             raise LookupError('Unable to find an instance for {0}'.format(self.class_obj))
+
+
+class InjectorProxy(object):
+    """
+    Alternate way of using the injector with a Proxy
+
+        >>> dm = DependencyMap()
+        >>> myfoo = dm.proxy(FOO)
+
+    This code is based on the LocalProxy implemented by Werkzeug
+    https://github.com/pallets/werkzeug/blob/master/werkzeug/local.py#L254
+    """
+    __slots__ = ('__dependencies', '__class_obj', '__dict__')
+
+    def __init__(self, dependencies, class_obj):
+        object.__setattr__(self, '_InjectorProxy__dependencies', dependencies)
+        object.__setattr__(self, '_InjectorProxy__class_obj', class_obj)
+
+    def _get_current_object(self):
+        try:
+            return self.__dependencies[self.__class_obj]
+        except KeyError:
+            raise LookupError('Unable to find an instance for {0}'.format(self.__class_obj))
+
+    @property
+    def __dict__(self):
+        return self._get_current_object().__dict__
+
+    def __repr__(self):
+        return repr(self._get_current_object())
+
+    def __bool__(self):
+        return bool(self._get_current_object())
+
+    def __unicode__(self):
+        return unicode(self._get_current_object())
+
+    def __dir__(self):
+        return dir(self._get_current_object())
+
+    def __getattr__(self, name):
+        return getattr(self._get_current_object(), name)
+
+    def __setitem__(self, key, value):
+        self._get_current_object()[key] = value
+
+    def __delitem__(self, key):
+        del self._get_current_object()[key]
+
+    if PY2:
+        __getslice__ = lambda x, i, j: x._get_current_object()[i:j]
+
+        def __setslice__(self, i, j, seq):
+            self._get_current_object()[i:j] = seq
+
+        def __delslice__(self, i, j):
+            del self._get_current_object()[i:j]
+
+    __setattr__ = lambda x, n, v: setattr(x._get_current_object(), n, v)
+    __delattr__ = lambda x, n: delattr(x._get_current_object(), n)
+    __str__ = lambda x: str(x._get_current_object())
+    __lt__ = lambda x, o: x._get_current_object() < o
+    __le__ = lambda x, o: x._get_current_object() <= o
+    __eq__ = lambda x, o: x._get_current_object() == o
+    __ne__ = lambda x, o: x._get_current_object() != o
+    __gt__ = lambda x, o: x._get_current_object() > o
+    __ge__ = lambda x, o: x._get_current_object() >= o
+    __cmp__ = lambda x, o: cmp(x._get_current_object(), o)
+    __hash__ = lambda x: hash(x._get_current_object())
+    __call__ = lambda x, *a, **kw: x._get_current_object()(*a, **kw)
+    __len__ = lambda x: len(x._get_current_object())
+    __getitem__ = lambda x, i: x._get_current_object()[i]
+    __iter__ = lambda x: iter(x._get_current_object())
+    __contains__ = lambda x, i: i in x._get_current_object()
+    __add__ = lambda x, o: x._get_current_object() + o
+    __sub__ = lambda x, o: x._get_current_object() - o
+    __mul__ = lambda x, o: x._get_current_object() * o
+    __floordiv__ = lambda x, o: x._get_current_object() // o
+    __mod__ = lambda x, o: x._get_current_object() % o
+    __divmod__ = lambda x, o: x._get_current_object().__divmod__(o)
+    __pow__ = lambda x, o: x._get_current_object() ** o
+    __lshift__ = lambda x, o: x._get_current_object() << o
+    __rshift__ = lambda x, o: x._get_current_object() >> o
+    __and__ = lambda x, o: x._get_current_object() & o
+    __xor__ = lambda x, o: x._get_current_object() ^ o
+    __or__ = lambda x, o: x._get_current_object() | o
+    __div__ = lambda x, o: x._get_current_object().__div__(o)
+    __truediv__ = lambda x, o: x._get_current_object().__truediv__(o)
+    __neg__ = lambda x: -(x._get_current_object())
+    __pos__ = lambda x: +(x._get_current_object())
+    __abs__ = lambda x: abs(x._get_current_object())
+    __invert__ = lambda x: ~(x._get_current_object())
+    __complex__ = lambda x: complex(x._get_current_object())
+    __int__ = lambda x: int(x._get_current_object())
+    __long__ = lambda x: long(x._get_current_object())  # noqa
+    __float__ = lambda x: float(x._get_current_object())
+    __oct__ = lambda x: oct(x._get_current_object())
+    __hex__ = lambda x: hex(x._get_current_object())
+    __index__ = lambda x: x._get_current_object().__index__()
+    __coerce__ = lambda x, o: x._get_current_object().__coerce__(x, o)
+    __enter__ = lambda x: x._get_current_object().__enter__()
+    __exit__ = lambda x, *a, **kw: x._get_current_object().__exit__(*a, **kw)
+    __radd__ = lambda x, o: o + x._get_current_object()
+    __rsub__ = lambda x, o: o - x._get_current_object()
+    __rmul__ = lambda x, o: o * x._get_current_object()
+    __rdiv__ = lambda x, o: o / x._get_current_object()
+    if PY2:
+        __rtruediv__ = lambda x, o: x._get_current_object().__rtruediv__(o)
+    else:
+        __rtruediv__ = __rdiv__
+    __rfloordiv__ = lambda x, o: o // x._get_current_object()
+    __rmod__ = lambda x, o: o % x._get_current_object()
+    __rdivmod__ = lambda x, o: x._get_current_object().__rdivmod__(o)
+    __copy__ = lambda x: copy.copy(x._get_current_object())
+    __deepcopy__ = lambda x, memo: copy.deepcopy(x._get_current_object(), memo)
